@@ -16,7 +16,10 @@
     "ai"
   ],
   "main": "src/plugin.ts",
-  "files": ["src", "README.md"],
+  "files": [
+    "src",
+    "README.md"
+  ],
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit"
@@ -24,6 +27,7 @@
   "dependencies": {
     "@opencode-ai/plugin": "^1.2.15",
     "@opencode-ai/sdk": "^1.2.15",
+    "@opencode/plugin": "^2.0.16",
     "zod": "^4.1.13"
   },
   "devDependencies": {
