@@ -6,7 +6,7 @@
  */
 
 import { Plugin } from "@opencode/plugin"
-import type { TextPartInput } from "@opencode/sdk"
+import type { TextPartInput } from "@opencode-ai/sdk"
 import { isBinaryFile, formatFileContent } from "./vendor"
 import * as path from "node:path"
 import * as fs from "node:fs/promises"
@@ -51,7 +51,97 @@ After generating the handoff message, IMMEDIATELY call handoff_session with your
 \`handoff_session(prompt="...", files=["src/foo.ts", "src/bar.ts", ...])\``
 
 // File reference regex matching OpenCode's internal pattern
+/**
+ * Derive a display title for a completed tool part from its content.
+ * V1 used `state.title`; V2 completed tool state carries content instead.
+ */
+function toolTitle(state: { content?: ReadonlyArray<{ type: string; text?: string }> }): string {
+  const text = state.content?.find(c => c.type === "text" && c.text)?.text
+  if (!text) return ""
+  const firstLine = text.split("\n")[0] ?? ""
+  return firstLine.length > 100 ? firstLine.slice(0, 97) + "..." : firstLine
+}
+
+// Message shapes from ctx.session.context() (SessionMessageInfo union).
+// Typed loosely: the SDK union's text/tool part variants differ structurally
+// and only the fields rendered below are relevant.
+type V2Message = {
+  type: string
+  text?: string
+  files?: ReadonlyArray<{ name?: string }>
+  content?: ReadonlyArray<any>
+}
+
+/**
+ * Format a conversation transcript for display (ported from V1 formatTranscript).
+ *
+ * V1 read `{ info: { role }, parts }` shapes from client.session.messages();
+ * V2 session.context() returns flat messages, so the source shape differs but
+ * the output format is identical: '## User' / '## Assistant' sections with
+ * text rendered, file parts as '[Attached: <filename>]', and completed tool
+ * parts as '[Tool: <tool>] <title>'.
+ *
+ * @param messages - Flat V2 session messages
+ * @param limit - Limit used to indicate if results are truncated
+ * @returns Formatted transcript with user/assistant sections
+ */
+export function formatTranscript(
+  messages: ReadonlyArray<V2Message>,
+  limit?: number
+): string {
+  const lines: string[] = []
+
+  for (const msg of messages) {
+    if (msg.type === "user") {
+      lines.push("## User")
+      if (msg.text) {
+        lines.push(msg.text)
+      }
+      for (const file of msg.files ?? []) {
+        lines.push(`[Attached: ${file.name || "file"}]`)
+      }
+      lines.push("")
+    }
+
+    if (msg.type === "assistant") {
+      lines.push("## Assistant")
+      for (const part of msg.content ?? []) {
+        if (part.type === "text" && part.text) {
+          lines.push(part.text)
+        }
+        if (part.type === "tool" && part.state?.status === "completed") {
+          lines.push(`[Tool: ${part.name ?? "tool"}] ${toolTitle(part.state)}`)
+        }
+      }
+      lines.push("")
+    }
+  }
+
+  const output = lines.join("\n").trim()
+
+  if (messages.length >= (limit ?? 100)) {
+    return output + `\n\n(Showing ${messages.length} most recent messages. Use a higher 'limit' to see more.)`
+  }
+
+  return output + `\n\n(End of session - ${messages.length} messages)`
+}
+
 const FILE_REGEX = /(?<![\w`])@(\.?[^\s`,.]*(?:\.[^\s`,.]+)*)/g
+
+/**
+ * TUI surface used for the review-before-send handoff flow.
+ *
+ * Not present in the current @opencode/plugin Context type declarations,
+ * so it is accessed defensively at runtime; if the host does not provide it,
+ * the tool reports a clear failure instead of crashing.
+ */
+interface TuiApi {
+  executeCommand(input: { body: { command: string } }): Promise<void>
+  appendPrompt(input: { body: { text: string } }): Promise<void>
+  showToast(input: {
+    body: { title: string; message: string; variant: string; duration: number }
+  }): Promise<void>
+}
 
 export function parseFileReferences(text: string): Set<string> {
   const fileRefs = new Set<string>()
@@ -105,7 +195,7 @@ export default Plugin.define({
     const processedSessions = new Set<string>()
 
     // Register command via V2 API
-    ctx.command.transform((editor: any) => {
+    await ctx.command.transform((editor: any) => {
       editor.add({
         name: "handoff",
         description: "Create a focused handoff prompt for a new session",
@@ -121,7 +211,7 @@ export default Plugin.define({
     })
 
     // Register tools via V2 API
-    ctx.tool.transform((editor: any) => {
+    await ctx.tool.transform((editor: any) => {
       editor.add({
         name: "handoff_session",
         description: "Create a new session with the handoff prompt as an editable draft",
@@ -137,24 +227,48 @@ export default Plugin.define({
           },
           required: ["prompt"],
         },
-        async execute(input: any) {
+        async execute(input: any, context: { sessionID?: string }) {
           const args = input as { prompt: string; files?: string[] }
-          const sessionReference = `Continuing work from session. When you lack specific information you can use read_session to get it.`
-          const fileRefs = args.files?.length
-            ? args.files.map(f => `@${f.replace(/^@/, '')}`).join(' ')
-            : ''
-          const fullPrompt = fileRefs
-            ? `${sessionReference}\n\n${fileRefs}\n\n${args.prompt}`
-            : `${sessionReference}\n\n${args.prompt}`
+          // V2 passes the calling session's ID via the tool context (ToolContext.sessionID)
+          const sessionReference = `Continuing work from session ${context.sessionID}. When you lack specific information you can use read_session to get it.`
+
+          // Attach actual file contents (rendered as synthetic Read-tool output)
+          // so the new session has the file context pre-loaded — plain @path
+          // text alone doesn't carry the contents over.
+          const refs = new Set((args.files ?? []).map(f => f.replace(/^@/, "")))
+          const fileParts = refs.size
+            ? await buildSyntheticFileParts(ctx.location.directory, refs)
+            : []
+          const fileContext = fileParts.length
+            ? "\n\n" + fileParts.map(p => p.text).join("\n\n")
+            : ""
+
+          const fullPrompt = `${sessionReference}${fileContext}\n\n${args.prompt}`
 
           try {
-            const session: any = await ctx.session.create({ title: "Handoff session" })
-            const newId = session?.id || session?.data?.id || ""
-            await ctx.session.prompt({
-              sessionID: newId,
-              text: fullPrompt,
+            const tui = (ctx as unknown as { tui?: TuiApi }).tui
+            if (!tui) {
+              return { content: "Failed to create handoff session: TUI API is not available in this context." }
+            }
+
+            await tui.executeCommand({ body: { command: "session_new" } })
+            // session_new is fire-and-forget (publishes a bus event, returns immediately).
+            // The TUI needs time to navigate to the home screen and mount the new prompt
+            // input before appendPrompt can insert text — otherwise the event is silently
+            // dropped because the input component doesn't exist yet.
+            await new Promise(r => setTimeout(r, 150))
+            await tui.appendPrompt({ body: { text: fullPrompt } })
+
+            await tui.showToast({
+              body: {
+                title: "Handoff Ready",
+                message: "Review and edit the draft, then send",
+                variant: "success",
+                duration: 4000,
+              },
             })
-            return { content: `Handoff session created (${newId}) with the handoff prompt.` }
+
+            return { content: "Handoff prompt created in new session. Review and edit before sending." }
           } catch (e) {
             return { content: `Failed to create handoff session: ${e}` }
           }
@@ -175,7 +289,23 @@ export default Plugin.define({
         async execute(input: any) {
           const args = input as { sessionID: string; limit?: number }
           const limit = Math.min(args.limit ?? 100, 500)
-          return { content: `(Session ${args.sessionID} - ${limit} messages)` }
+
+          try {
+            // V2 note: the plugin ctx exposes session.context() (flat messages),
+            // not the V1 client's session.messages(). The limit is applied
+            // client-side by slicing the most recent messages.
+            const response = await ctx.session.context({ sessionID: args.sessionID })
+            const messages = response.slice(-limit)
+
+            if (messages.length === 0) {
+              return { content: "Session has no messages or does not exist." }
+            }
+
+            return { content: formatTranscript(messages, limit) }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "Unknown error"
+            return { content: `Could not read session ${args.sessionID}: ${message}` }
+          }
         },
       })
     })
