@@ -47,8 +47,8 @@ USER: $ARGUMENTS
 
 ---
 
-After generating the handoff message, IMMEDIATELY call handoff-session with your prompt and files:
-\`handoff-session(prompt="...", files=["src/foo.ts", "src/bar.ts", ...])\``
+After generating the handoff message, IMMEDIATELY call handoff with your prompt and files:
+\`handoff(prompt="...", files=["src/foo.ts", "src/bar.ts", ...])\``
 
 // File reference regex matching OpenCode's internal pattern
 /**
@@ -213,7 +213,7 @@ export default Plugin.define({
     // Register tools via V2 API
     await ctx.tool.transform((editor: any) => {
       editor.add({
-        name: "handoff-session",
+        name: "handoff",
         description: "Create a new session with the handoff prompt as an editable draft",
         input: {
           type: "object",

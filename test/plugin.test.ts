@@ -61,10 +61,10 @@ describe("opencode-handoff V2 plugin", () => {
     expect(typeof commands[0]!.execute).toBe("function")
 
     expect(tools).toHaveLength(2)
-    expect(tools.map((t) => t.name).sort()).toEqual(["handoff-session", "read_session"])
+    expect(tools.map((t) => t.name).sort()).toEqual(["handoff", "read_session"])
   })
 
-  test("handoff-session opens a TUI draft with source session ID and file contents", async () => {
+  test("handoff opens a TUI draft with source session ID and file contents", async () => {
     const directory = await mkdtemp(join(tmpdir(), "opencode-handoff-v2-"))
     try {
       await writeFile(join(directory, "note.txt"), "handoff context")
@@ -84,7 +84,7 @@ describe("opencode-handoff V2 plugin", () => {
       }
       await plugin.setup(ctx)
 
-      const handoff = getTool(tools, "handoff-session")
+      const handoff = getTool(tools, "handoff")
       const result = await handoff.execute(
         {
           prompt: "Continue implementation",
